@@ -18,6 +18,10 @@ categories = ["development-tools::testing", "network-programming"]
 name = "moq-test-client"
 path = "src/main.rs"
 
+[[bin]]
+name = "moq-telehealth-bench"
+path = "src/bin/telehealth_bench.rs"
+
 [dependencies]
 moq-transport = { path = "../moq-transport", version = "0.14" }
 moq-native-ietf = { path = "../moq-native-ietf", version = "0.8" }
