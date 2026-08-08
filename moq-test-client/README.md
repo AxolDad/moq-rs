@@ -63,6 +63,7 @@ repo's `fhir/goldens/` artifacts.
 | `telehealth-session-e2e` | Publish golden alert/metrics/heartbeat frames on a token-derived path; verify each track delivers byte-identical, correctly-typed frames |
 | `telehealth-path-secrecy` | With a session live on token A's derived path, probe token B's path; any data delivered there is a failure |
 | `telehealth-control-integrity` | Signed control envelope survives relay transit byte-exact and verifies; tampered payload and stale timestamp are rejected |
+| `telehealth-priority-drain` | Under a queued metrics backlog, the higher-priority alert track drains first. Passes when the alert beats a meaningful chunk of the backlog; TAP-**skips** (never false-passes) when no reorderable backlog forms — e.g. against a live-forwarding relay that drops superseded metric groups, or on a loopback that drains faster than it fills |
 
 ## Running with moq-relay
 

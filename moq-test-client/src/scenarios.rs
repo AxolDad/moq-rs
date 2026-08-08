@@ -42,10 +42,15 @@ async fn connect(
     Ok((session, connection_id, transport))
 }
 
-/// Collected connection IDs from a test run
+/// Collected connection IDs from a test run, plus an optional TAP skip
+/// directive. A scenario sets `skip` when it ran cleanly but could not reach
+/// a verdict in this environment (e.g. loopback drained a backlog too fast to
+/// observe priority scheduling) — reported as `ok N # SKIP <reason>`, never a
+/// silent pass.
 #[derive(Debug, Default)]
 pub struct TestConnectionIds {
     pub cids: Vec<String>,
+    pub skip: Option<String>,
 }
 
 impl TestConnectionIds {

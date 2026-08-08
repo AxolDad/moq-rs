@@ -86,6 +86,8 @@ pub enum TestCase {
     TelehealthPathSecrecy,
     /// TH3: Signed control envelopes survive transit byte-exact; tampered/stale are rejected
     TelehealthControlIntegrity,
+    /// TH4: Under a metrics backlog, the higher-priority alert track drains first
+    TelehealthPriorityDrain,
 }
 
 impl TestCase {
@@ -100,6 +102,7 @@ impl TestCase {
             TestCase::TelehealthSessionE2e,
             TestCase::TelehealthPathSecrecy,
             TestCase::TelehealthControlIntegrity,
+            TestCase::TelehealthPriorityDrain,
         ]
     }
 
@@ -114,6 +117,7 @@ impl TestCase {
             TestCase::TelehealthSessionE2e => "telehealth-session-e2e",
             TestCase::TelehealthPathSecrecy => "telehealth-path-secrecy",
             TestCase::TelehealthControlIntegrity => "telehealth-control-integrity",
+            TestCase::TelehealthPriorityDrain => "telehealth-priority-drain",
         }
     }
 }
@@ -126,16 +130,23 @@ pub struct TestResult {
     pub duration: Duration,
     pub message: Option<String>,
     pub cids: Vec<String>,
+    /// TAP skip directive: the test ran but reached no verdict here.
+    pub skip: Option<String>,
 }
 
 impl TestResult {
-    fn success(test_case: TestCase, duration: Duration, cids: Vec<String>) -> Self {
+    fn success(
+        test_case: TestCase,
+        duration: Duration,
+        cids: scenarios::TestConnectionIds,
+    ) -> Self {
         Self {
             test_case,
             passed: true,
             duration,
             message: None,
-            cids,
+            skip: cids.skip,
+            cids: cids.cids,
         }
     }
 
@@ -146,6 +157,7 @@ impl TestResult {
             duration,
             message: Some(message),
             cids: Vec::new(),
+            skip: None,
         }
     }
 }
@@ -166,12 +178,13 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
         TestCase::TelehealthControlIntegrity => {
             telehealth::test_telehealth_control_integrity(args).await
         }
+        TestCase::TelehealthPriorityDrain => telehealth::test_telehealth_priority_drain(args).await,
     };
 
     let duration = start.elapsed();
 
     match result {
-        Ok(cids) => TestResult::success(test_case, duration, cids.cids),
+        Ok(cids) => TestResult::success(test_case, duration, cids),
         Err(e) => TestResult::failure(test_case, duration, format!("{:#}", e)),
     }
 }
@@ -179,7 +192,10 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
 fn print_tap_result(test_number: usize, result: &TestResult, verbose: bool) {
     let status = if result.passed { "ok" } else { "not ok" };
     let name = result.test_case.name();
-    println!("{} {} - {}", status, test_number, name);
+    match &result.skip {
+        Some(reason) => println!("{} {} - {} # SKIP {}", status, test_number, name, reason),
+        None => println!("{} {} - {}", status, test_number, name),
+    }
 
     // YAML diagnostic block
     println!("  ---");

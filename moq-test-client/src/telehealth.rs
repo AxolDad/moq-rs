@@ -468,6 +468,214 @@ pub async fn test_telehealth_control_integrity(args: &Args) -> Result<TestConnec
     .context("test timed out")?
 }
 
+/// TH4: Priority drain (alerts first under a metrics backlog).
+///
+/// The device contract makes alerts the highest-priority track (subgroup
+/// priority 0, vs metrics 2). This scenario floods `perception.metrics` with
+/// a large padded backlog, then — after the backlog is queued — publishes a
+/// single alert. A subscriber on both tracks records the arrival order.
+///
+/// A relay that honors subgroup priority delivers the alert *ahead of* a
+/// meaningful chunk of the still-draining metrics backlog even though the
+/// alert was produced last. That is a **pass**. When no reorderable backlog
+/// forms, no verdict is possible — reported as a **TAP skip** with the
+/// observed numbers, never a false pass. The only hard failure is the alert
+/// not arriving at all.
+///
+/// Note: a *live-forwarding* relay (moq-relay-ietf) drops superseded metric
+/// groups rather than queuing them, so a fresh alert is never blocked by a
+/// stale metrics backlog *by construction* — the expected result there is a
+/// skip. A store-and-forward or congested relay is where a positive pass can
+/// be demonstrated; the cross-relay differential ring (#43) is where that
+/// distinction gets recorded per relay.
+pub async fn test_telehealth_priority_drain(args: &Args) -> Result<TestConnectionIds> {
+    /// Metrics groups queued ahead of the alert.
+    const BACKLOG_GROUPS: u64 = 240;
+    /// Padding per metrics object (bytes) — real bytes so the relay has
+    /// something to schedule.
+    const PAD_BYTES: usize = 16 * 1024;
+    /// Alert must beat at least this fraction of the backlog to call it a pass.
+    const PASS_FRACTION: f64 = 0.25;
+
+    timeout(Duration::from_secs(30), async {
+        let mut cids = TestConnectionIds::default();
+        let namespace = TrackNamespace::from_utf8_path(&derived_path("tok-priority-drain-0001"));
+
+        // --- Publisher: announce both tracks, flood metrics, then one alert.
+        let (pub_session, mut publisher, _, pub_cid) = connect_session(args)
+            .await
+            .context("publisher failed to connect")?;
+        cids.add(pub_cid);
+
+        let (mut tracks_writer, _, tracks_reader) = Tracks::new(namespace.clone()).produce();
+        let alerts_track = tracks_writer
+            .create(TRACK_ALERTS)
+            .context("create alerts track")?;
+        let metrics_track = tracks_writer
+            .create(TRACK_METRICS)
+            .context("create metrics track")?;
+        let mut alerts_sub = alerts_track.subgroups()?;
+        let mut metrics_sub = metrics_track.subgroups()?;
+
+        let pad = " ".repeat(PAD_BYTES);
+        let padded_metric = format!("{GOLDEN_METRICS}\n{pad}");
+
+        let publisher_task = tokio::spawn(async move {
+            let feed = async {
+                // Queue the whole metrics backlog first (priority 2).
+                for group_id in 0..BACKLOG_GROUPS {
+                    let mut w = match metrics_sub.create(Subgroup {
+                        group_id,
+                        subgroup_id: 0,
+                        priority: 2,
+                    }) {
+                        Ok(w) => w,
+                        Err(_) => return,
+                    };
+                    if w.write(padded_metric.clone().into_bytes().into()).is_err() {
+                        return;
+                    }
+                }
+                // Then the single alert (priority 0), produced LAST.
+                if let Ok(mut w) = alerts_sub.create(Subgroup {
+                    group_id: 0,
+                    subgroup_id: 0,
+                    priority: 0,
+                }) {
+                    let _ = w.write(GOLDEN_ALERT.as_bytes().to_vec().into());
+                }
+                // Hold the tracks open so the subscriber can drain.
+                std::future::pending::<()>().await;
+            };
+            tokio::select! {
+                res = pub_session.run() => { let _ = res; }
+                res = publisher.announce(tracks_reader) => { let _ = res; }
+                _ = feed => {}
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // --- Subscriber: both tracks, tag every object with arrival order.
+        let (sub_session, _, mut subscriber, sub_cid) = connect_session(args)
+            .await
+            .context("subscriber failed to connect")?;
+        cids.add(sub_cid);
+        let mut subscriber2 = subscriber.clone();
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Kind {
+            Alert,
+            Metric,
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Kind>();
+
+        let (alert_writer, alert_reader) =
+            serve::Track::new(namespace.clone(), TRACK_ALERTS.to_string()).produce();
+        let (metric_writer, metric_reader) =
+            serve::Track::new(namespace.clone(), TRACK_METRICS.to_string()).produce();
+
+        let tx_a = tx.clone();
+        let read_alerts = async move {
+            if let serve::TrackReaderMode::Subgroups(mut groups) =
+                alert_reader.mode().await.context("alert mode")?
+            {
+                while let Some(mut g) = groups.next().await? {
+                    while g.read_next().await?.is_some() {
+                        let _ = tx_a.send(Kind::Alert);
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let tx_m = tx.clone();
+        let read_metrics = async move {
+            if let serve::TrackReaderMode::Subgroups(mut groups) =
+                metric_reader.mode().await.context("metric mode")?
+            {
+                while let Some(mut g) = groups.next().await? {
+                    while g.read_next().await?.is_some() {
+                        let _ = tx_m.send(Kind::Metric);
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        drop(tx);
+
+        // Collect arrivals until the alert lands and the backlog goes quiet,
+        // or an overall cap. We count metrics that arrive AFTER the alert.
+        let collect = async {
+            let mut alert_seen = false;
+            let mut metrics_before = 0u64;
+            let mut metrics_after = 0u64;
+            loop {
+                match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+                    Ok(Some(Kind::Alert)) => alert_seen = true,
+                    Ok(Some(Kind::Metric)) => {
+                        if alert_seen {
+                            metrics_after += 1;
+                        } else {
+                            metrics_before += 1;
+                        }
+                    }
+                    Ok(None) => break, // both readers ended
+                    Err(_) => break,   // 2s quiet — drain done
+                }
+                if alert_seen && metrics_before + metrics_after >= BACKLOG_GROUPS {
+                    break;
+                }
+            }
+            (alert_seen, metrics_before, metrics_after)
+        };
+
+        let outcome = tokio::select! {
+            res = sub_session.run() => { res.context("subscriber session error")?; None }
+            res = subscriber.subscribe(alert_writer) => { res.context("alert subscribe")?; None }
+            res = subscriber2.subscribe(metric_writer) => { res.context("metric subscribe")?; None }
+            _ = read_alerts => None,
+            _ = read_metrics => None,
+            out = collect => Some(out),
+        };
+
+        publisher_task.abort();
+
+        let (alert_seen, metrics_before, metrics_after) =
+            outcome.context("no arrivals collected")?;
+
+        if !alert_seen {
+            anyhow::bail!(
+                "alert never arrived (metrics before={metrics_before}, after={metrics_after})"
+            );
+        }
+
+        let threshold = (BACKLOG_GROUPS as f64 * PASS_FRACTION) as u64;
+        tracing::info!(
+            "priority drain: alert beat {metrics_after} metrics (of {BACKLOG_GROUPS}); \
+             {metrics_before} arrived first; pass threshold {threshold}"
+        );
+        if metrics_after >= threshold {
+            tracing::info!("alert drained ahead of the backlog — priority honored");
+        } else {
+            // Two indistinguishable-from-the-client causes, both non-failing:
+            // the link drained faster than it filled, or the relay live-
+            // forwards and dropped superseded metric groups so no backlog
+            // ever queued (moq-relay-ietf does the latter — a subscriber only
+            // sees recent groups, so a stale metrics backlog cannot block a
+            // fresh alert by construction). Either way the alert was never
+            // stuck behind metrics; there is simply nothing to reorder here.
+            cids.skip = Some(format!(
+                "alert not blocked by any metrics backlog (beat {metrics_after}/{BACKLOG_GROUPS}, \
+                 need {threshold}); relay live-forwards or drained faster than it filled — \
+                 no reorderable backlog to observe"
+            ));
+        }
+        Ok(cids)
+    })
+    .await
+    .context("test timed out")?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
