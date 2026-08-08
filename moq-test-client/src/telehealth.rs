@@ -140,6 +140,53 @@ async fn connect_session(
     Ok((session, publisher, subscriber, cid))
 }
 
+/// Connect at the WebTransport layer only (no MoQT SETUP), so a fault
+/// scenario can misbehave below the protocol — open raw streams, write
+/// garbage, never handshake. Returns the raw session.
+async fn connect_raw(args: &Args) -> Result<web_transport::Session> {
+    let tls = args.tls.load()?;
+    let quic = moq_native_ietf::quic::Endpoint::new(moq_native_ietf::quic::Config::new(
+        args.bind, None, tls,
+    )?)?;
+    let (session, _cid, _transport) = quic.client.connect(&args.relay, None).await?;
+    Ok(session)
+}
+
+/// Publish the golden alert on a token-derived path and return the running
+/// publisher task plus its namespace — the innocent bystander whose survival
+/// each fault scenario asserts.
+fn spawn_bystander(
+    args_session: (Session, moq_transport::session::Publisher),
+    token: &str,
+) -> (TrackNamespace, tokio::task::JoinHandle<()>) {
+    let namespace = TrackNamespace::from_utf8_path(&derived_path(token));
+    let (session, publisher) = args_session;
+    let task = spawn_frame_publisher(
+        session,
+        publisher,
+        namespace.clone(),
+        vec![(TRACK_ALERTS, 0, GOLDEN_ALERT)],
+    )
+    .expect("bystander publisher");
+    (namespace, task)
+}
+
+/// Assert the bystander delivers its golden alert byte-identical (used after
+/// a fault to prove the relay isolated it and stayed up).
+async fn assert_bystander_delivers(args: &Args, namespace: TrackNamespace) -> Result<()> {
+    let (sub_session, _, subscriber, _) = connect_session(args)
+        .await
+        .context("bystander subscriber failed to connect (relay down?)")?;
+    let object = read_first_object(sub_session, subscriber, namespace, TRACK_ALERTS)
+        .await
+        .context("bystander received no data after the fault")?;
+    let received = std::str::from_utf8(&object).context("bystander frame not UTF-8")?;
+    if received != GOLDEN_ALERT {
+        anyhow::bail!("bystander frame corrupted after the fault");
+    }
+    Ok(())
+}
+
 /// Spawn a publisher that announces `namespace` and re-writes each
 /// `(track, priority, frame)` in a fresh group every 200 ms, so that a
 /// subscriber joining at any point receives current data.
@@ -670,6 +717,163 @@ pub async fn test_telehealth_priority_drain(args: &Args) -> Result<TestConnectio
                  no reorderable backlog to observe"
             ));
         }
+        Ok(cids)
+    })
+    .await
+    .context("test timed out")?
+}
+
+/// TH5: Garbage-stream fault isolation.
+///
+/// A hostile connection speaks WebTransport but not MoQT: it opens a
+/// unidirectional stream and writes garbage bytes, never completing SETUP.
+/// A concurrent, well-behaved bystander session must keep delivering its
+/// golden alert byte-identical — proving the relay rejects/ignores the
+/// malformed peer without taking down healthy sessions or the process.
+pub async fn test_telehealth_fault_garbage_stream(args: &Args) -> Result<TestConnectionIds> {
+    timeout(TEST_TIMEOUT, async {
+        let mut cids = TestConnectionIds::default();
+
+        // Bystander up first.
+        let (pub_session, publisher, _, pub_cid) = connect_session(args)
+            .await
+            .context("bystander publisher failed to connect")?;
+        cids.add(pub_cid);
+        let (namespace, bystander) =
+            spawn_bystander((pub_session, publisher), "tok-fault-garbage-0001");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Hostile peer: raw garbage on a uni stream, no SETUP.
+        let garbage_result = async {
+            let raw = connect_raw(args).await.context("raw connect")?;
+            let mut stream = raw.open_uni().await.context("open_uni")?;
+            stream.write(&[0xff; 4096]).await.context("write garbage")?;
+            // Hold the hostile session open a moment, then drop it.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(stream);
+            drop(raw);
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        // A relay that closes the hostile connection outright is a valid
+        // (good) response — the write/connect erroring is not a test failure.
+        if let Err(e) = garbage_result {
+            tracing::info!("hostile peer rejected by relay (expected-ok): {e:#}");
+        }
+
+        // The bystander must still deliver.
+        let result = assert_bystander_delivers(args, namespace).await;
+        bystander.abort();
+        result?;
+        tracing::info!("bystander survived garbage-stream fault");
+        Ok(cids)
+    })
+    .await
+    .context("test timed out")?
+}
+
+/// TH6: Subscribe/unsubscribe churn isolation.
+///
+/// A hostile session rapidly subscribes to and drops subscriptions on a
+/// bystander's derived path (and sibling non-existent paths) many times.
+/// The bystander must keep delivering — the relay must not leak the path,
+/// stall, or leak subscription state under churn.
+pub async fn test_telehealth_fault_subscribe_churn(args: &Args) -> Result<TestConnectionIds> {
+    const CHURN: usize = 60;
+
+    timeout(TEST_TIMEOUT, async {
+        let mut cids = TestConnectionIds::default();
+
+        let (pub_session, publisher, _, pub_cid) = connect_session(args)
+            .await
+            .context("bystander publisher failed to connect")?;
+        cids.add(pub_cid);
+        let (namespace, bystander) =
+            spawn_bystander((pub_session, publisher), "tok-fault-churn-0001");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Hostile churner on its own connection.
+        let (churn_session, _, mut churn_sub, churn_cid) = connect_session(args)
+            .await
+            .context("churner failed to connect")?;
+        cids.add(churn_cid);
+
+        let churn = async {
+            for i in 0..CHURN {
+                // Alternate between the real path and a sibling guess.
+                let target = if i % 2 == 0 {
+                    namespace.clone()
+                } else {
+                    TrackNamespace::from_utf8_path(&derived_path(&format!("tok-churn-guess-{i}")))
+                };
+                let (writer, _reader) =
+                    serve::Track::new(target, TRACK_ALERTS.to_string()).produce();
+                // Start the subscribe, give it a beat, then drop it (unsubscribe).
+                let sub = churn_sub.subscribe(writer);
+                tokio::select! {
+                    _ = sub => {}
+                    _ = tokio::time::sleep(Duration::from_millis(15)) => {}
+                }
+            }
+        };
+        tokio::select! {
+            _ = churn => {}
+            res = churn_session.run() => { res.context("churn session error")?; }
+        }
+        tracing::info!("completed {CHURN} subscribe/unsubscribe cycles");
+
+        let result = assert_bystander_delivers(args, namespace).await;
+        bystander.abort();
+        result?;
+        tracing::info!("bystander survived subscribe-churn fault");
+        Ok(cids)
+    })
+    .await
+    .context("test timed out")?
+}
+
+/// TH7: Abrupt-disconnect isolation.
+///
+/// A publisher announces, begins a session, then vanishes mid-flight (its
+/// connection is dropped without a clean PUBLISH_NAMESPACE_DONE). A separate
+/// bystander session, started fresh after the drop, must be served normally
+/// — the relay must reclaim the dead publisher's state and keep going.
+pub async fn test_telehealth_fault_abrupt_disconnect(args: &Args) -> Result<TestConnectionIds> {
+    timeout(TEST_TIMEOUT, async {
+        let mut cids = TestConnectionIds::default();
+
+        // Doomed publisher: announce on a path, then drop everything.
+        let doomed_path = TrackNamespace::from_utf8_path(&derived_path("tok-fault-doomed-0001"));
+        {
+            let (pub_session, publisher, _, doomed_cid) = connect_session(args)
+                .await
+                .context("doomed publisher failed to connect")?;
+            cids.add(doomed_cid);
+            let task = spawn_frame_publisher(
+                pub_session,
+                publisher,
+                doomed_path.clone(),
+                vec![(TRACK_ALERTS, 0, GOLDEN_ALERT)],
+            )?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Abrupt vanish: no clean teardown.
+            task.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Fresh bystander on a different path must be served normally.
+        let (pub_session, publisher, _, pub_cid) = connect_session(args)
+            .await
+            .context("bystander publisher failed to connect after drop (relay down?)")?;
+        cids.add(pub_cid);
+        let (namespace, bystander) =
+            spawn_bystander((pub_session, publisher), "tok-fault-bystander-0001");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let result = assert_bystander_delivers(args, namespace).await;
+        bystander.abort();
+        result?;
+        tracing::info!("bystander served normally after abrupt publisher disconnect");
         Ok(cids)
     })
     .await
