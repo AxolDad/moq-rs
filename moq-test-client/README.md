@@ -51,6 +51,19 @@ moq-test-client --relay https://localhost:4443 --tls-disable-verify
 | `subscribe-before-announce` | Subscriber subscribes before publisher announces |
 | `publish-namespace-done` | Announce namespace, send PUBLISH_NAMESPACE_DONE |
 
+### Telehealth perception conformance (TH group)
+
+Black-box scenarios for the telehealth perception contract (token-derived
+broadcast paths, three JSON data tracks, HMAC-signed control envelopes).
+Payloads and the signing vector are pinned byte-for-byte to the perception
+repo's `fhir/goldens/` artifacts.
+
+| Test | Description |
+|------|-------------|
+| `telehealth-session-e2e` | Publish golden alert/metrics/heartbeat frames on a token-derived path; verify each track delivers byte-identical, correctly-typed frames |
+| `telehealth-path-secrecy` | With a session live on token A's derived path, probe token B's path; any data delivered there is a failure |
+| `telehealth-control-integrity` | Signed control envelope survives relay transit byte-exact and verifies; tampered payload and stale timestamp are rejected |
+
 ## Running with moq-relay
 
 ```bash

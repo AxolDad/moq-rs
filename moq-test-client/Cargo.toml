@@ -25,6 +25,12 @@ web-transport = { workspace = true }
 
 url = "2"
 
+# Telehealth conformance scenarios (derived paths, signed control envelopes)
+bytes = "1"
+hmac = "0.12"
+serde_json = "1"
+sha2 = "0.10"
+
 # Async stuff
 tokio = { version = "1", features = ["full", "time"] }
 

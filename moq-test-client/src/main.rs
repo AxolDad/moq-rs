@@ -28,6 +28,7 @@ use clap::{Parser, ValueEnum};
 use url::Url;
 
 mod scenarios;
+mod telehealth;
 
 /// MoQT Interop Test Client
 #[derive(Parser, Clone)]
@@ -79,6 +80,12 @@ pub enum TestCase {
     SubscribeBeforeAnnounce,
     /// T0.6: Announce namespace, receive OK, send PUBLISH_NAMESPACE_DONE
     PublishNamespaceDone,
+    /// TH1: Publish golden perception session (3 tracks, token-derived path), verify byte-identical delivery
+    TelehealthSessionE2e,
+    /// TH2: Probe a sibling token-derived path, verify the relay serves no data there
+    TelehealthPathSecrecy,
+    /// TH3: Signed control envelopes survive transit byte-exact; tampered/stale are rejected
+    TelehealthControlIntegrity,
 }
 
 impl TestCase {
@@ -90,6 +97,9 @@ impl TestCase {
             TestCase::AnnounceSubscribe,
             TestCase::SubscribeBeforeAnnounce,
             TestCase::PublishNamespaceDone,
+            TestCase::TelehealthSessionE2e,
+            TestCase::TelehealthPathSecrecy,
+            TestCase::TelehealthControlIntegrity,
         ]
     }
 
@@ -101,6 +111,9 @@ impl TestCase {
             TestCase::AnnounceSubscribe => "announce-subscribe",
             TestCase::SubscribeBeforeAnnounce => "subscribe-before-announce",
             TestCase::PublishNamespaceDone => "publish-namespace-done",
+            TestCase::TelehealthSessionE2e => "telehealth-session-e2e",
+            TestCase::TelehealthPathSecrecy => "telehealth-path-secrecy",
+            TestCase::TelehealthControlIntegrity => "telehealth-control-integrity",
         }
     }
 }
@@ -148,6 +161,11 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
         TestCase::AnnounceSubscribe => scenarios::test_announce_subscribe(args).await,
         TestCase::SubscribeBeforeAnnounce => scenarios::test_subscribe_before_announce(args).await,
         TestCase::PublishNamespaceDone => scenarios::test_publish_namespace_done(args).await,
+        TestCase::TelehealthSessionE2e => telehealth::test_telehealth_session_e2e(args).await,
+        TestCase::TelehealthPathSecrecy => telehealth::test_telehealth_path_secrecy(args).await,
+        TestCase::TelehealthControlIntegrity => {
+            telehealth::test_telehealth_control_integrity(args).await
+        }
     };
 
     let duration = start.elapsed();
