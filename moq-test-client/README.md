@@ -78,6 +78,28 @@ cargo run --bin moq-relay -- --bind 0.0.0.0:4443 --tls-cert dev/localhost.crt --
 cargo run --bin moq-test-client -- --relay https://localhost:4443 --tls-disable-verify
 ```
 
+## Load / soak harness (`moq-telehealth-bench`)
+
+A companion binary drives N concurrent synthetic telehealth sessions (each
+publishing the three data tracks on its own token-derived path at contract
+cadence) and measures end-to-end alert delivery latency and delivery ratio.
+Latency is stamped into each alert payload and read back by the session's own
+subscriber, so the number is real one-way latency through the relay.
+
+```bash
+# Short load profile (default): 25 sessions, 30 s
+cargo run --bin moq-telehealth-bench -- --relay https://localhost:4443 --tls-disable-verify
+
+# Soak with reconnect churn, JSON summary
+cargo run --bin moq-telehealth-bench -- --relay https://localhost:4443 --tls-disable-verify \
+    --sessions 50 --duration-secs 1800 --churn --json
+```
+
+Reports `p50/p95/p99/max` alert latency, alerts sent/received, and delivery
+ratio. A long `--duration-secs` turns the load profile into a soak; `--churn`
+restarts each session's publisher at the halfway mark (the token-grace
+reconnect path). Parameters map to draft-evens-moq-bench where applicable.
+
 ## Exit Codes
 
 | Code | Meaning |
