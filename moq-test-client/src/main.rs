@@ -88,6 +88,12 @@ pub enum TestCase {
     TelehealthControlIntegrity,
     /// TH4: Under a metrics backlog, the higher-priority alert track drains first
     TelehealthPriorityDrain,
+    /// TH5: Garbage on a raw stream doesn't take down a concurrent healthy session
+    TelehealthFaultGarbageStream,
+    /// TH6: Subscribe/unsubscribe churn doesn't stall or leak a bystander's path
+    TelehealthFaultSubscribeChurn,
+    /// TH7: An abrupt publisher disconnect doesn't stop the relay serving fresh sessions
+    TelehealthFaultAbruptDisconnect,
 }
 
 impl TestCase {
@@ -103,6 +109,9 @@ impl TestCase {
             TestCase::TelehealthPathSecrecy,
             TestCase::TelehealthControlIntegrity,
             TestCase::TelehealthPriorityDrain,
+            TestCase::TelehealthFaultGarbageStream,
+            TestCase::TelehealthFaultSubscribeChurn,
+            TestCase::TelehealthFaultAbruptDisconnect,
         ]
     }
 
@@ -118,6 +127,9 @@ impl TestCase {
             TestCase::TelehealthPathSecrecy => "telehealth-path-secrecy",
             TestCase::TelehealthControlIntegrity => "telehealth-control-integrity",
             TestCase::TelehealthPriorityDrain => "telehealth-priority-drain",
+            TestCase::TelehealthFaultGarbageStream => "telehealth-fault-garbage-stream",
+            TestCase::TelehealthFaultSubscribeChurn => "telehealth-fault-subscribe-churn",
+            TestCase::TelehealthFaultAbruptDisconnect => "telehealth-fault-abrupt-disconnect",
         }
     }
 }
@@ -179,6 +191,15 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
             telehealth::test_telehealth_control_integrity(args).await
         }
         TestCase::TelehealthPriorityDrain => telehealth::test_telehealth_priority_drain(args).await,
+        TestCase::TelehealthFaultGarbageStream => {
+            telehealth::test_telehealth_fault_garbage_stream(args).await
+        }
+        TestCase::TelehealthFaultSubscribeChurn => {
+            telehealth::test_telehealth_fault_subscribe_churn(args).await
+        }
+        TestCase::TelehealthFaultAbruptDisconnect => {
+            telehealth::test_telehealth_fault_abrupt_disconnect(args).await
+        }
     };
 
     let duration = start.elapsed();

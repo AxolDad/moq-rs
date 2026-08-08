@@ -64,6 +64,9 @@ repo's `fhir/goldens/` artifacts.
 | `telehealth-path-secrecy` | With a session live on token A's derived path, probe token B's path; any data delivered there is a failure |
 | `telehealth-control-integrity` | Signed control envelope survives relay transit byte-exact and verifies; tampered payload and stale timestamp are rejected |
 | `telehealth-priority-drain` | Under a queued metrics backlog, the higher-priority alert track drains first. Passes when the alert beats a meaningful chunk of the backlog; TAP-**skips** (never false-passes) when no reorderable backlog forms — e.g. against a live-forwarding relay that drops superseded metric groups, or on a loopback that drains faster than it fills |
+| `telehealth-fault-garbage-stream` | A hostile peer writes garbage on a raw WebTransport stream (no MoQT SETUP); a concurrent healthy session must keep delivering its golden alert byte-identical |
+| `telehealth-fault-subscribe-churn` | Rapid subscribe/unsubscribe churn on a bystander's derived path and sibling guesses must not stall the relay or leak the path; the bystander keeps delivering |
+| `telehealth-fault-abrupt-disconnect` | A publisher vanishes mid-session without clean teardown; the relay must reclaim its state and serve a fresh bystander session normally |
 
 ## Running with moq-relay
 
