@@ -60,7 +60,10 @@ for spec in "${SPECS[@]}"; do
   name="${spec%%=*}"
   url="${spec#*=}"
   NAMES+=("$name")
-  echo "running against $name ($url)..." >&2
+  # Never echo the URL: an authenticated relay carries its token as `?jwt=…`,
+  # and this line would put a live credential in logs and CI output. The
+  # joined report prints relay NAMES only, for the same reason.
+  echo "running against $name ($(printf '%s' "$url" | sed -E 's#(\?|&)jwt=[^&]*#\1jwt=REDACTED#g'))..." >&2
   ./target/debug/moq-test-client --relay "$url" --bind '0.0.0.0:0' $TLS_FLAG \
     >"$WORK/$name.tap" 2>/dev/null || true
 done
